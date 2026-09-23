@@ -32,7 +32,7 @@
      field-tone  = slow full-screen color treatment above the canvas
      ------------------------------------------------------------------ */
   canvas#stage{ position:absolute; inset:0; width:100%; height:100%; z-index:1; cursor:default; background:#000; }
-  video#sourceVideo{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0; pointer-events:none; }
+  video#sourceVideo{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0.01; pointer-events:none; }
 
 
   .field-tone{
@@ -662,6 +662,9 @@ const differenceCanvas = document.createElement('canvas');
 const dctx = differenceCanvas.getContext('2d');
 const maskCanvas = document.createElement('canvas');
 const mctx = maskCanvas.getContext('2d');
+const lastGoodCanvas = document.createElement('canvas');
+const lgctx = lastGoodCanvas.getContext('2d');
+let haveGoodFrame = false;
 const posterImg = new Image();
 posterImg.src = video.poster || '';
 
@@ -772,6 +775,9 @@ function resize(){
   PH = Math.round(PW * (H / W));
   srcCanvas.width = workCanvas.width = accumCanvas.width = tempCanvas.width = differenceCanvas.width = maskCanvas.width = PW;
   srcCanvas.height = workCanvas.height = accumCanvas.height = tempCanvas.height = differenceCanvas.height = maskCanvas.height = PH;
+  lastGoodCanvas.width = PW;
+  lastGoodCanvas.height = PH;
+  haveGoodFrame = false;
   cols = Math.max(TUNING.minColumns, Math.round(PW / TUNING.fieldCellPixels));
   rows = Math.max(TUNING.minRows, Math.round(PH / TUNING.fieldCellPixels));
   cellW = PW / cols;
@@ -842,19 +848,51 @@ window.addEventListener('touchmove', e => {
 /* Read the current video frame and grade it toward separated RGB.
    Pixel access happens at the reduced processing resolution because
    getImageData() is one of the more expensive operations in the pipeline. */
-function drawSource(){
-  tctx.clearRect(0, 0, PW, PH);
-  if (video.readyState >= 2 && video.videoWidth){
-    coverDraw(video, tctx, PW, PH);
+function drawFallbackSource(){
+  if (haveGoodFrame){
+    tctx.drawImage(lastGoodCanvas, 0, 0);
   } else if (posterImg.complete && posterImg.naturalWidth){
     coverDraw(posterImg, tctx, PW, PH);
   } else {
     tctx.fillStyle = '#000';
     tctx.fillRect(0, 0, PW, PH);
   }
+}
 
-  const frame = tctx.getImageData(0, 0, PW, PH);
-  const d = frame.data;
+function drawSource(){
+  tctx.clearRect(0, 0, PW, PH);
+  let usedVideo = false;
+  if (video.readyState >= 2 && video.videoWidth){
+    coverDraw(video, tctx, PW, PH);
+    usedVideo = true;
+  } else {
+    drawFallbackSource();
+  }
+
+  let frame = tctx.getImageData(0, 0, PW, PH);
+  let d = frame.data;
+
+  // Mobile browsers (notably iOS Safari) can report a ready video but hand
+  // the canvas empty black frames, e.g. when playback is paused by low-power
+  // mode or the frame has not been decoded yet. The source video never
+  // contains black frames, so a near-black sample means the frame is invalid:
+  // reuse the last good frame (or the poster) instead of feeding black into
+  // the feedback loop, which would otherwise fade the whole hero to black.
+  if (usedVideo){
+    let sum = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4 * 97){ sum += d[i] + d[i + 1] + d[i + 2]; n++; }
+    if (n && sum / (n * 3) < 10){
+      tctx.clearRect(0, 0, PW, PH);
+      drawFallbackSource();
+      frame = tctx.getImageData(0, 0, PW, PH);
+      d = frame.data;
+      resumeVideo();
+    } else {
+      lgctx.clearRect(0, 0, PW, PH);
+      lgctx.drawImage(tempCanvas, 0, 0);
+      haveGoodFrame = true;
+    }
+  }
   for (let i = 0; i < d.length; i += 4){
     let r = d[i];
     let g = d[i + 1];
@@ -1180,6 +1218,33 @@ video.autoplay = true;
 video.playbackRate = 1; // Source-video playback rate controls how quickly new imagery enters the feedback loop.
 video.play().catch(() => {});
 video.addEventListener('loadeddata', () => { video.playbackRate = 0.6; video.play().catch(() => {}); }, { once:true });
+
+/* Mobile playback recovery.
+   iOS Safari handles large data: URI videos unreliably, so the embedded
+   video is re-wrapped as a Blob URL. Playback is also resumed after touches,
+   tab switches, and returning to the hero, since mobile browsers may pause
+   muted background video (for example in low-power mode). */
+function resumeVideo(){
+  if (video.paused && heroVisible && !document.hidden){
+    video.play().catch(() => {});
+  }
+}
+(function useBlobSource(){
+  const source = video.querySelector('source');
+  if (!source || !source.src.startsWith('data:') || !window.fetch || !window.URL || !URL.createObjectURL) return;
+  fetch(source.src)
+    .then(r => r.blob())
+    .then(blob => {
+      source.src = URL.createObjectURL(blob);
+      video.addEventListener('loadeddata', () => { video.playbackRate = 0.6; resumeVideo(); }, { once:true });
+      video.load();
+      resumeVideo();
+    })
+    .catch(() => {});
+})();
+window.addEventListener('touchstart', resumeVideo, { passive:true });
+window.addEventListener('pointerdown', resumeVideo);
+document.addEventListener('visibilitychange', resumeVideo);
 const heroStage = document.querySelector('.hero-stage');
 if ('IntersectionObserver' in window && heroStage){
   new IntersectionObserver(entries => {
@@ -1187,6 +1252,7 @@ if ('IntersectionObserver' in window && heroStage){
     if (heroVisible){
       lastRAF = performance.now();
       lastProcess = 0;
+      resumeVideo();
     }
   }, { threshold:0.02 }).observe(heroStage);
 }
