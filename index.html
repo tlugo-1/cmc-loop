@@ -465,6 +465,19 @@
     top:1.7rem;
   }
 
+  /* Pages 2/3 pointer effects: rainbow ripples behind the content, hearts
+     from the illustration drawn on a fixed layer above everything. */
+  .ripple-layer{
+    position:absolute; inset:0; width:100%; height:100%;
+    z-index:0; pointer-events:none; display:block;
+  }
+  .content-page > .page-inner{ position:relative; z-index:1; }
+  #heart-layer{
+    position:fixed; inset:0; width:100%; height:100%;
+    z-index:50; pointer-events:none;
+  }
+  .submit-illustration{ cursor:pointer; }
+
   @media (max-width:840px){
     html{ scroll-snap-type:y proximity; }
     .page-inner{ width:min(100% - 2rem, 1240px); }
@@ -514,7 +527,7 @@
     <div class="kicker">JHU Creative Media Center presents</div>
     <div class="title-stack">
       <div class="wordmark">LOOP</div>
-      <div class="pill"><span class="dot"></span> Open Call — Time-Based Media</div>
+      <div class="pill"><span class="dot"></span> Time-Based Media Exhibition</div>
     </div>
     <div class="dates">Nov 2–20, 2026 <span class="sep">/</span> Bloomberg Student Center</div>
   </div>
@@ -533,6 +546,7 @@
        The media area is for a non-effected 'promo' video alongside the
        exhibition description. -->
   <section class="page content-page" id="info">
+    <canvas class="ripple-layer" aria-hidden="true"></canvas>
     <span class="page-number">02 / 03</span>
     <div class="page-inner info-grid">
       <div class="clean-video-placeholder" aria-label="Placeholder for a clean, non-effected LOOP video">
@@ -555,6 +569,7 @@
   <!-- PAGE 03 / SUBMIT -----------------------------------------------
        Submission information and footer. -->
   <section class="page content-page submit-page" id="submit">
+    <canvas class="ripple-layer" aria-hidden="true"></canvas>
     <span class="page-number">03 / 03</span>
     <div class="page-inner submit-layout">
       <div class="submit-main">
@@ -595,6 +610,7 @@
     </div>
   </section>
 </main>
+<canvas id="heart-layer" aria-hidden="true"></canvas>
 
 <script>
 
@@ -665,6 +681,33 @@ const mctx = maskCanvas.getContext('2d');
 const lastGoodCanvas = document.createElement('canvas');
 const lgctx = lastGoodCanvas.getContext('2d');
 let haveGoodFrame = false;
+// Portrait screens crop the landscape video down to its warm, yellow centre.
+// Under the blue phase of the multiply overlay a yellow image has almost no
+// blue to pass through, so it renders as black. On portrait viewports some
+// luminance is blended back into each channel so every overlay hue has image
+// detail to show. Landscape (desktop) screens are left untouched.
+let portraitLumaMix = 0;
+
+/* Diagnostics: add ?debug to the page URL to show live video/canvas state
+   in the top-left corner. Nothing is shown or changed without it. */
+const debugState = { path:'', bright:0, error:'' };
+const debugEl = /[?&]debug\b/.test(location.search) ? document.createElement('pre') : null;
+if (debugEl){
+  debugEl.style.cssText = 'position:fixed;left:8px;top:48px;z-index:99;margin:0;padding:6px 8px;background:rgba(0,0,0,.75);color:#0f0;font:11px/1.35 monospace;white-space:pre-wrap;max-width:92vw;pointer-events:none;';
+  document.addEventListener('DOMContentLoaded', () => document.body.appendChild(debugEl));
+}
+let lastDebug = 0;
+function updateDebug(ts){
+  if (!debugEl || ts - lastDebug < 250) return;
+  lastDebug = ts;
+  debugEl.textContent =
+    'video ready:' + video.readyState + ' paused:' + video.paused + ' t:' + video.currentTime.toFixed(2) +
+    '\nsize:' + video.videoWidth + 'x' + video.videoHeight + ' src:' + (video.currentSrc || '').slice(0, 5) +
+    ' err:' + (video.error ? video.error.code : '-') +
+    '\npath:' + debugState.path + ' bright:' + debugState.bright +
+    '\ncanvas:' + W + 'x' + H + ' proc:' + PW + 'x' + PH +
+    (debugState.error ? '\nERROR ' + debugState.error : '');
+}
 const posterImg = new Image();
 posterImg.src = video.poster || '';
 
@@ -775,6 +818,7 @@ function resize(){
   PH = Math.round(PW * (H / W));
   srcCanvas.width = workCanvas.width = accumCanvas.width = tempCanvas.width = differenceCanvas.width = maskCanvas.width = PW;
   srcCanvas.height = workCanvas.height = accumCanvas.height = tempCanvas.height = differenceCanvas.height = maskCanvas.height = PH;
+  portraitLumaMix = H > W ? 0.6 : 0;
   lastGoodCanvas.width = PW;
   lastGoodCanvas.height = PH;
   haveGoodFrame = false;
@@ -859,6 +903,23 @@ function drawFallbackSource(){
   }
 }
 
+// Returns the average RGB brightness of a sparse sample of a frame.
+// Transparent (undrawn) pixels read as black, so this catches both cases.
+function frameBrightness(d){
+  let sum = 0, n = 0;
+  for (let i = 0; i < d.length; i += 4 * 97){ sum += (d[i] + d[i + 1] + d[i + 2]) * (d[i + 3] / 255); n++; }
+  return n ? sum / (n * 3) : 0;
+}
+
+function readTemp(){
+  try {
+    return tctx.getImageData(0, 0, PW, PH);
+  } catch (err){
+    debugState.error = 'getImageData: ' + err.name;
+    return null;
+  }
+}
+
 function drawSource(){
   tctx.clearRect(0, 0, PW, PH);
   let usedVideo = false;
@@ -869,30 +930,48 @@ function drawSource(){
     drawFallbackSource();
   }
 
-  let frame = tctx.getImageData(0, 0, PW, PH);
-  let d = frame.data;
+  let frame = readTemp();
+  let bright = frame ? frameBrightness(frame.data) : 0;
+  debugState.path = usedVideo ? 'video' : (haveGoodFrame ? 'last-good' : 'poster');
 
   // Mobile browsers (notably iOS Safari) can report a ready video but hand
-  // the canvas empty black frames, e.g. when playback is paused by low-power
-  // mode or the frame has not been decoded yet. The source video never
-  // contains black frames, so a near-black sample means the frame is invalid:
-  // reuse the last good frame (or the poster) instead of feeding black into
-  // the feedback loop, which would otherwise fade the whole hero to black.
-  if (usedVideo){
-    let sum = 0, n = 0;
-    for (let i = 0; i < d.length; i += 4 * 97){ sum += d[i] + d[i + 1] + d[i + 2]; n++; }
-    if (n && sum / (n * 3) < 10){
-      tctx.clearRect(0, 0, PW, PH);
-      drawFallbackSource();
-      frame = tctx.getImageData(0, 0, PW, PH);
-      d = frame.data;
-      resumeVideo();
-    } else {
-      lgctx.clearRect(0, 0, PW, PH);
-      lgctx.drawImage(tempCanvas, 0, 0);
-      haveGoodFrame = true;
-    }
+  // the canvas empty or black frames, e.g. when playback is paused by
+  // low-power mode or a frame has not been decoded yet. The source video
+  // never contains black frames, so a near-black sample means the frame is
+  // invalid: reuse the last good frame (or the poster) instead of feeding
+  // black into the feedback loop, which would fade the whole hero to black.
+  if (usedVideo && bright < 10){
+    tctx.clearRect(0, 0, PW, PH);
+    drawFallbackSource();
+    frame = readTemp();
+    bright = frame ? frameBrightness(frame.data) : 0;
+    debugState.path = 'video-blank → ' + (haveGoodFrame ? 'last-good' : 'poster');
+    resumeVideo();
+  } else if (usedVideo && frame){
+    lgctx.clearRect(0, 0, PW, PH);
+    lgctx.drawImage(tempCanvas, 0, 0);
+    haveGoodFrame = true;
   }
+  debugState.bright = Math.round(bright);
+
+  // If pixel readback itself is failing (blank or blocked), skip the RGB
+  // grade and pass the drawn image straight through so the hero keeps an
+  // image; on browsers where readback works this path is never used.
+  if (!frame || bright < 10){
+    debugState.path += ' / ungraded';
+    // Readback failed even for the poster, so the blank reading came from
+    // readback rather than the video: use the live video frame ungraded.
+    if (usedVideo){
+      tctx.clearRect(0, 0, PW, PH);
+      coverDraw(video, tctx, PW, PH);
+      debugState.path = 'video / ungraded';
+    }
+    sctx.clearRect(0, 0, PW, PH);
+    sctx.drawImage(tempCanvas, 0, 0);
+    return;
+  }
+
+  const d = frame.data;
   for (let i = 0; i < d.length; i += 4){
     let r = d[i];
     let g = d[i + 1];
@@ -919,6 +998,13 @@ function drawSource(){
       r += 16;
       g += 8;
       b += 22;
+    }
+
+    if (portraitLumaMix){
+      const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      r += (l - r) * portraitLumaMix;
+      g += (l - g) * portraitLumaMix;
+      b += (l - b) * portraitLumaMix;
     }
 
     d[i]     = Math.max(0, Math.min(255, r));
@@ -1201,9 +1287,14 @@ function animate(ts){
   lastRAF = ts;
   if (!lastProcess || ts - lastProcess >= 1000 / TUNING.fps){
     lastProcess = ts;
-    processFrame(dt);
+    try {
+      processFrame(dt);
+    } catch (err){
+      debugState.error = err.name + ': ' + err.message;
+    }
   }
   drawToScreen();
+  updateDebug(ts);
 }
 
 /* --------------------------------------------------------------------------
@@ -1259,6 +1350,174 @@ if ('IntersectionObserver' in window && heroStage){
 
 requestAnimationFrame(animate);
 
+</script>
+
+<script>
+/* ==========================================================================
+   PAGES 2/3 POINTER EFFECTS
+   Moving the pointer over pages 2 and 3 leaves rainbow ripples behind the
+   content. Hovering the illustration on page 3 releases hearts instead.
+   ========================================================================== */
+(function initContentPointerFx(){
+  const sections = [...document.querySelectorAll('.content-page')];
+  const rippleCanvases = sections.map(sec => sec.querySelector('.ripple-layer')).filter(Boolean);
+  const heartCanvas = document.getElementById('heart-layer');
+  const duck = document.querySelector('.submit-illustration');
+  if (!rippleCanvases.length || !heartCanvas) return;
+
+  const heartCtx = heartCanvas.getContext('2d');
+  const layers = rippleCanvases.map(c => ({ canvas:c, ctx:c.getContext('2d'), ripples:[] }));
+  let hearts = [];
+  let heartOrigin = null;
+  let heartBeat = 0;
+  let running = false;
+  let dpr = 1;
+
+  function sizeCanvas(c, ctx){
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = c.offsetWidth, h = c.offsetHeight;
+    if (!w || !h) return;
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  function resize(){
+    layers.forEach(l => sizeCanvas(l.canvas, l.ctx));
+    sizeCanvas(heartCanvas, heartCtx);
+  }
+
+  function hslToRgb(h, s, l){
+    s /= 100; l /= 100;
+    const k = n => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    return { r:Math.round(255 * f(0)), g:Math.round(255 * f(8)), b:Math.round(255 * f(4)) };
+  }
+  function rippleColor(r){
+    const c = hslToRgb(r.hue, 85, 62);
+    return `rgba(${c.r},${c.g},${c.b},${r.opacity})`;
+  }
+
+  function drawHeart(ctx, x, y, s, opacity){
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.beginPath();
+    ctx.moveTo(0, s * 0.2);
+    ctx.bezierCurveTo(0, -s * 0.35, -s, -s * 0.35, -s, s * 0.1);
+    ctx.bezierCurveTo(-s, s * 0.55, 0, s * 0.95, 0, s * 1.15);
+    ctx.bezierCurveTo(0, s * 0.95, s, s * 0.55, s, s * 0.1);
+    ctx.bezierCurveTo(s, -s * 0.35, 0, -s * 0.35, 0, s * 0.2);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(220, 32, 48, ${opacity})`;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function addHeart(x, y){
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 0.35 + Math.random() * 0.9;
+    hearts.push({ x, y, vx:Math.cos(angle) * speed, vy:Math.sin(angle) * speed,
+                  size:13 + Math.random() * 5, opacity:1 });
+  }
+
+  function isOverDuck(x, y){
+    if (!duck) return false;
+    const b = duck.getBoundingClientRect();
+    return x >= b.left && x <= b.right && y >= b.top && y <= b.bottom;
+  }
+
+  function start(){
+    if (running) return;
+    running = true;
+    requestAnimationFrame(animate);
+  }
+
+  function onMove(clientX, clientY){
+    if (isOverDuck(clientX, clientY)){
+      heartOrigin = { x:clientX, y:clientY };
+      start();
+      return;
+    }
+    heartOrigin = null;
+    for (const l of layers){
+      const b = l.canvas.getBoundingClientRect();
+      if (clientY < b.top || clientY > b.bottom || clientX < b.left || clientX > b.right) continue;
+      l.ripples.push({
+        x:clientX - b.left, y:clientY - b.top, radius:0, opacity:1,
+        hue:(performance.now() / 12 + clientX * 0.35) % 360
+      });
+      start();
+      break;
+    }
+  }
+
+  window.addEventListener('pointermove', e => {
+    if (e.pointerType === 'touch') return;
+    onMove(e.clientX, e.clientY);
+  });
+  // Touch: hearts while a finger rests on the illustration; page scrolling is unaffected.
+  if (duck){
+    duck.addEventListener('touchstart', e => {
+      const t = e.touches[0]; if (t){ heartOrigin = { x:t.clientX, y:t.clientY }; start(); }
+    }, { passive:true });
+    duck.addEventListener('touchmove', e => {
+      const t = e.touches[0]; if (t) heartOrigin = { x:t.clientX, y:t.clientY };
+    }, { passive:true });
+    duck.addEventListener('touchend', () => { heartOrigin = null; });
+    duck.addEventListener('mouseleave', () => { heartOrigin = null; });
+  }
+  // Scrolling moves the illustration out from under a still pointer.
+  window.addEventListener('scroll', () => { heartOrigin = null; }, { passive:true });
+
+  function animate(){
+    let busy = false;
+
+    for (const l of layers){
+      const w = l.canvas.width / dpr, h = l.canvas.height / dpr;
+      l.ctx.clearRect(0, 0, w, h);
+      for (const r of l.ripples){
+        l.ctx.beginPath();
+        l.ctx.arc(r.x, r.y, r.radius, 0, Math.PI * 2);
+        l.ctx.strokeStyle = rippleColor(r);
+        l.ctx.lineWidth = 2;
+        l.ctx.stroke();
+        r.radius += 3.5;
+        r.opacity -= 0.01;
+        r.hue = (r.hue + 1.4) % 360;
+      }
+      l.ripples = l.ripples.filter(r => r.opacity > 0);
+      if (l.ripples.length) busy = true;
+    }
+
+    heartCtx.clearRect(0, 0, heartCanvas.width / dpr, heartCanvas.height / dpr);
+    if (heartOrigin){
+      heartBeat += 1;
+      if (heartBeat % 10 === 1) addHeart(heartOrigin.x, heartOrigin.y);
+      busy = true;
+    } else {
+      heartBeat = 0;
+    }
+    for (const hrt of hearts){
+      drawHeart(heartCtx, hrt.x, hrt.y, hrt.size, hrt.opacity);
+      hrt.x += hrt.vx;
+      hrt.y += hrt.vy;
+      hrt.opacity -= 0.0045;
+    }
+    hearts = hearts.filter(hrt => hrt.opacity > 0);
+    if (hearts.length) busy = true;
+
+    // The loop sleeps when nothing is moving, so pages 2/3 cost nothing at rest.
+    if (busy) requestAnimationFrame(animate);
+    else running = false;
+  }
+
+  window.addEventListener('resize', resize);
+  if ('ResizeObserver' in window){
+    const ro = new ResizeObserver(resize);
+    rippleCanvases.forEach(c => ro.observe(c));
+  }
+  resize();
+})();
 </script>
 
 </body>
